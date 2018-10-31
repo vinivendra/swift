@@ -15,9 +15,9 @@
 // with the goal of standardization in a future version of Swift.
 //
 // Constant expressions are functions without side effects that take constant
-// values and return constant values.  These constants may be integer, floating
-// point, and string values, or arrays thereof (up to 1024 elements).  We allow
-// abstractions to be built out of fragile structs and tuples.
+// values and return constant values.  These constants may be integer, and
+// floating point values.   We allow abstractions to be built out of fragile
+// structs and tuples.
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,6 +30,7 @@
 
 namespace swift {
 class ApplyInst;
+class ASTContext;
 class Operand;
 class SILInstruction;
 class SILModule;
@@ -41,9 +42,10 @@ enum class UnknownReason;
 /// This class is the main entrypoint for evaluating constant expressions.  It
 /// also handles caching of previously computed constexpr results.
 class ConstExprEvaluator {
-  /// This is a long-lived bump pointer allocator that holds the arguments and
-  /// result values for the cached constexpr calls we have already analyzed.
-  llvm::BumpPtrAllocator &allocator;
+  /// We store arguments and result values for the cached constexpr calls we
+  /// have already analyzed in this ASTContext so that they are available even
+  /// after this ConstExprEvaluator is gone.
+  ASTContext &astContext;
 
   /// The current call stack, used for providing accurate diagnostics.
   llvm::SmallVector<SourceLoc, 4> callStack;
@@ -55,7 +57,7 @@ public:
   explicit ConstExprEvaluator(SILModule &m);
   ~ConstExprEvaluator();
 
-  llvm::BumpPtrAllocator &getAllocator() { return allocator; }
+  ASTContext &getASTContext() { return astContext; }
 
   void pushCallStack(SourceLoc loc) { callStack.push_back(loc); }
 

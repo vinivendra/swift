@@ -17,6 +17,13 @@
 #include "llvm/Support/TrailingObjects.h"
 using namespace swift;
 
+namespace swift {
+llvm::cl::opt<unsigned>
+    ConstExprLimit("constexpr-limit", llvm::cl::init(512),
+                   llvm::cl::desc("Number of instructions interpreted in a"
+                                  " constexpr function"));
+}
+
 template <typename... T, typename... U>
 static InFlightDiagnostic diagnose(ASTContext &Context, SourceLoc loc,
                                    Diag<T...> diag, U &&... args) {
@@ -92,25 +99,26 @@ SymbolicValue::Kind SymbolicValue::getKind() const {
   }
 }
 
-/// Clone this SymbolicValue into the specified allocator and return the new
+/// Clone this SymbolicValue into the specified ASTContext and return the new
 /// version.  This only works for valid constants.
 SymbolicValue
-SymbolicValue::cloneInto(llvm::BumpPtrAllocator &allocator) const {
+SymbolicValue::cloneInto(ASTContext &astContext) const {
   auto thisRK = representationKind;
   switch (thisRK) {
   case RK_Unknown:
   case RK_Metatype:
   case RK_Function:
+    assert(0 && "cloning this representation kind is not supported");
   case RK_IntegerInline:
   case RK_Integer:
-    return SymbolicValue::getInteger(getIntegerValue(), allocator);
+    return SymbolicValue::getInteger(getIntegerValue(), astContext);
   case RK_Aggregate: {
     auto elts = getAggregateValue();
     SmallVector<SymbolicValue, 4> results;
     results.reserve(elts.size());
     for (auto elt : elts)
-      results.push_back(elt.cloneInto(allocator));
-    return getAggregate(results, allocator);
+      results.push_back(elt.cloneInto(astContext));
+    return getAggregate(results, astContext);
   }
   }
 }
@@ -128,14 +136,14 @@ SymbolicValue SymbolicValue::getInteger(int64_t value, unsigned bitWidth) {
 }
 
 SymbolicValue SymbolicValue::getInteger(const APInt &value,
-                                        llvm::BumpPtrAllocator &allocator) {
+                                        ASTContext &astContext) {
   // In the common case, we can form an inline representation.
   unsigned numWords = value.getNumWords();
   if (numWords == 1)
     return getInteger(value.getRawData()[0], value.getBitWidth());
 
   // Copy the integers from the APInt into the bump pointer.
-  auto *words = allocator.Allocate<uint64_t>(numWords);
+  auto *words = astContext.Allocate<uint64_t>(numWords).data();
   std::uninitialized_copy(value.getRawData(), value.getRawData() + numWords,
                           words);
 
@@ -173,9 +181,10 @@ unsigned SymbolicValue::getIntegerValueBitWidth() const {
 /// This returns a constant Symbolic value with the specified elements in it.
 /// This assumes that the elements lifetime has been managed for this.
 SymbolicValue SymbolicValue::getAggregate(ArrayRef<SymbolicValue> elements,
-                                          llvm::BumpPtrAllocator &allocator) {
-  // Copy the integers from the APInt into the bump pointer.
-  auto *resultElts = allocator.Allocate<SymbolicValue>(elements.size());
+                                          ASTContext &astContext) {
+  // Copy the elements into the bump pointer.
+  auto *resultElts =
+      astContext.Allocate<SymbolicValue>(elements.size()).data();
   std::uninitialized_copy(elements.begin(), elements.end(), resultElts);
 
   SymbolicValue result;
@@ -212,10 +221,10 @@ struct alignas(SourceLoc) UnknownSymbolicValue final
 
   static UnknownSymbolicValue *create(SILNode *node, UnknownReason reason,
                                       ArrayRef<SourceLoc> elements,
-                                      llvm::BumpPtrAllocator &allocator) {
+                                      ASTContext &astContext) {
     auto byteSize =
         UnknownSymbolicValue::totalSizeToAlloc<SourceLoc>(elements.size());
-    auto rawMem = allocator.Allocate(byteSize, alignof(UnknownSymbolicValue));
+    auto rawMem = astContext.Allocate(byteSize, alignof(UnknownSymbolicValue));
 
     // Placement-new the value inside the memory we just allocated.
     auto value = ::new (rawMem) UnknownSymbolicValue(
@@ -245,12 +254,12 @@ private:
 
 SymbolicValue SymbolicValue::getUnknown(SILNode *node, UnknownReason reason,
                                         llvm::ArrayRef<SourceLoc> callStack,
-                                        llvm::BumpPtrAllocator &allocator) {
+                                        ASTContext &astContext) {
   assert(node && "node must be present");
   SymbolicValue result;
   result.representationKind = RK_Unknown;
   result.value.unknown =
-      UnknownSymbolicValue::create(node, reason, callStack, allocator);
+      UnknownSymbolicValue::create(node, reason, callStack, astContext);
   return result;
 }
 
@@ -284,8 +293,8 @@ static SILDebugLocation skipInternalLocations(SILDebugLocation loc) {
     return loc;
 
   // Zip through inlined call site information that came from the
-  // implementation guts of the tensor library.  We want to report the
-  // message inside the user's code, not in the guts we inlined through.
+  // implementation guts of the library.  We want to report the message inside
+  // the user's code, not in the guts we inlined through.
   for (; auto ics = ds->InlinedCallSite; ds = ics) {
     // If we found a valid inlined-into location, then we are good.
     if (ds->Loc.getSourceLoc().isValid())
@@ -351,7 +360,8 @@ void SymbolicValue::emitUnknownDiagnosticNotes(SILLocation fallbackLoc) {
     break;
   case UnknownReason::TooManyInstructions:
     // TODO: Should pop up a level of the stack trace.
-    error = "expression is too large to evaluate at compile-time";
+    error = "exceeded instruction limit: " + std::to_string(ConstExprLimit) +
+            " when evaluating the expression at compile time";
     break;
   case UnknownReason::Loop:
     error = "control flow loop found";
@@ -377,7 +387,7 @@ void SymbolicValue::emitUnknownDiagnosticNotes(SILLocation fallbackLoc) {
   unsigned originalDiagnosticLineNumber =
       SM.getLineNumber(fallbackLoc.getSourceLoc());
   for (auto &sourceLoc : llvm::reverse(getUnknownCallStack())) {
-    // Skip known sources.
+    // Skip unknown sources.
     if (!sourceLoc.isValid())
       continue;
     // Also skip notes that point to the same line as the original error, for

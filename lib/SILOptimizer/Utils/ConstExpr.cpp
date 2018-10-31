@@ -22,15 +22,9 @@
 #include "swift/SIL/SILConstants.h"
 #include "swift/Serialization/SerializedSILLoader.h"
 #include "llvm/ADT/PointerEmbeddedInt.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/TrailingObjects.h"
 
 using namespace swift;
-
-static llvm::cl::opt<unsigned>
-    ConstExprLimit("constexpr-limit", llvm::cl::init(512),
-                   llvm::cl::desc("Number of instructions interpreted in a"
-                                  " constexpr function"));
 
 static llvm::Optional<SymbolicValue>
 evaluateAndCacheCall(SILFunction &fn, SubstitutionMap substitutionMap,
@@ -52,7 +46,8 @@ namespace {
 /// callee in a call chain to represent the constant values given the set of
 /// formal parameters that callee was invoked with.
 class ConstExprFunctionState {
-  /// This is the evaluator we put bump pointer allocated values into.
+  /// This is the evaluator that is computing this function state.  We use it to
+  /// allocate space for values and to query the call stack.
   ConstExprEvaluator &evaluator;
 
   /// If we are analyzing the body of a constexpr function, this is the
@@ -125,7 +120,7 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
   // If this a trivial constant instruction that we can handle, then fold it
   // immediately.
   if (auto *ili = dyn_cast<IntegerLiteralInst>(value))
-    return SymbolicValue::getInteger(ili->getValue(), evaluator.getAllocator());
+    return SymbolicValue::getInteger(ili->getValue(), evaluator.getASTContext());
 
   if (auto *fri = dyn_cast<FunctionRefInst>(value))
     return SymbolicValue::getFunction(fri->getReferencedFunction());
@@ -172,7 +167,7 @@ SymbolicValue ConstExprFunctionState::computeConstantValue(SILValue value) {
       elts.push_back(val);
     }
 
-    return SymbolicValue::getAggregate(elts, evaluator.getAllocator());
+    return SymbolicValue::getAggregate(elts, evaluator.getASTContext());
   }
 
   if (auto *builtin = dyn_cast<BuiltinInst>(value))
@@ -237,18 +232,18 @@ ConstExprFunctionState::computeConstantValueBuiltin(BuiltinInst *inst) {
           dstSigned ? result.sext(srcBitWidth) : result.zext(srcBitWidth);
       bool overflowed = (operandVal != reextended);
 
-      if (builtin.ID == BuiltinValueKind::UToSCheckedTrunc)
+      if (!srcSigned && dstSigned)
         overflowed |= result.isSignBitSet();
 
       if (overflowed)
         return evaluator.getUnknown(SILValue(inst), UnknownReason::Overflow);
 
-      auto &allocator = evaluator.getAllocator();
+      auto &astContext = evaluator.getASTContext();
       // Build the Symbolic value result for our truncated value.
       return SymbolicValue::getAggregate(
-          {SymbolicValue::getInteger(result, allocator),
-           SymbolicValue::getInteger(APInt(1, overflowed), allocator)},
-          allocator);
+          {SymbolicValue::getInteger(result, astContext),
+           SymbolicValue::getInteger(APInt(1, overflowed), astContext)},
+          astContext);
     };
 
     switch (builtin.ID) {
@@ -294,7 +289,7 @@ ConstExprFunctionState::computeConstantValueBuiltin(BuiltinInst *inst) {
           break;
         }
       }
-      return SymbolicValue::getInteger(result, evaluator.getAllocator());
+      return SymbolicValue::getInteger(result, evaluator.getASTContext());
     }
     }
   }
@@ -317,7 +312,7 @@ ConstExprFunctionState::computeConstantValueBuiltin(BuiltinInst *inst) {
 
       auto result = fn(operand0.getIntegerValue(), operand1.getIntegerValue());
       return SymbolicValue::getInteger(APInt(1, result),
-                                       evaluator.getAllocator());
+                                       evaluator.getASTContext());
     };
 
 #define REQUIRE_KIND(KIND)                                                     \
@@ -332,7 +327,7 @@ ConstExprFunctionState::computeConstantValueBuiltin(BuiltinInst *inst) {
   case BuiltinValueKind::OPCODE: {                                             \
     REQUIRE_KIND(Integer)                                                      \
     auto l = operand0.getIntegerValue(), r = operand1.getIntegerValue();       \
-    return SymbolicValue::getInteger((EXPR), evaluator.getAllocator());        \
+    return SymbolicValue::getInteger((EXPR), evaluator.getASTContext());       \
   }
       INT_BINOP(Add, l + r)
       INT_BINOP(And, l & r)
@@ -400,12 +395,12 @@ ConstExprFunctionState::computeConstantValueBuiltin(BuiltinInst *inst) {
       if (overflowed && !operand2.getIntegerValue().isNullValue())
         return evaluator.getUnknown(SILValue(inst), UnknownReason::Overflow);
 
-      auto &allocator = evaluator.getAllocator();
+      auto &astContext = evaluator.getASTContext();
       // Build the Symbolic value result for our normal and overflow bit.
       return SymbolicValue::getAggregate(
-          {SymbolicValue::getInteger(result, allocator),
-           SymbolicValue::getInteger(APInt(1, overflowed), allocator)},
-          allocator);
+          {SymbolicValue::getInteger(result, astContext),
+           SymbolicValue::getInteger(APInt(1, overflowed), astContext)},
+          astContext);
     };
 
     switch (builtin.ID) {
@@ -443,7 +438,6 @@ ConstExprFunctionState::computeOpaqueCallResult(ApplyInst *apply,
   return evaluator.getUnknown((SILInstruction *)apply, UnknownReason::Default);
 }
 
-// TODO: Refactor this to someplace common, this is defined in Devirtualize.cpp.
 /// Given a call to a function, determine whether it is a call to a constexpr
 /// function.  If so, collect its arguments as constants, fold it and return
 /// None.  If not, mark the results as Unknown, and return an Unknown with
@@ -477,7 +471,7 @@ ConstExprFunctionState::computeCallResult(ApplyInst *apply) {
   // correct value.
   SubstitutionMap calleeSubMap;
 
-  // Now that have successfully folded all of the parameters, we can evaluate
+  // Now that we have successfully folded all of the parameters, we can evaluate
   // the call.
   evaluator.pushCallStack(apply->getLoc().getSourceLoc());
   SmallVector<SymbolicValue, 4> results;
@@ -534,7 +528,8 @@ ConstExprFunctionState::evaluateFlowSensitive(SILInstruction *inst) {
   // These are just markers.
   if (isa<DebugValueInst>(inst) || isa<DebugValueAddrInst>(inst) ||
       isa<EndAccessInst>(inst) ||
-      // Constant have no important state.
+      // The interpreter doesn't model these memory management instructions, so
+      // skip them.
       isa<DestroyAddrInst>(inst) || isa<RetainValueInst>(inst) ||
       isa<ReleaseValueInst>(inst) || isa<StrongRetainInst>(inst) ||
       isa<StrongReleaseInst>(inst))
@@ -614,7 +609,7 @@ static llvm::Optional<SymbolicValue> evaluateAndCacheCall(
     // Make sure we haven't exceeded our interpreter iteration cap.
     if (++numInstEvaluated > ConstExprLimit)
       return SymbolicValue::getUnknown(inst, UnknownReason::TooManyInstructions,
-                                       {}, evaluator.getAllocator());
+                                       {}, evaluator.getASTContext());
 
     // If we can evaluate this flow sensitively, then keep going.
     if (!isa<TermInst>(inst)) {
@@ -631,7 +626,7 @@ static llvm::Optional<SymbolicValue> evaluateAndCacheCall(
         return val;
 
       // If we got a constant value, then we're good.  Set up the normal result
-      // values as well any indirect results.
+      // values as well as any indirect results.
       auto numNormalResults = conventions.getNumDirectSILResults();
       if (numNormalResults == 1) {
         results.push_back(val);
@@ -697,14 +692,14 @@ static llvm::Optional<SymbolicValue> evaluateAndCacheCall(
 //===----------------------------------------------------------------------===//
 
 ConstExprEvaluator::ConstExprEvaluator(SILModule &m)
-    : allocator(m.getASTContext().getAllocator()) {}
+    : astContext(m.getASTContext()) {}
 
 ConstExprEvaluator::~ConstExprEvaluator() {}
 
 SymbolicValue ConstExprEvaluator::getUnknown(SILNode *node,
                                              UnknownReason reason) {
   return SymbolicValue::getUnknown(node, reason, getCallStack(),
-                                   getAllocator());
+                                   getASTContext());
 }
 
 /// Analyze the specified values to determine if they are constant values.  This
@@ -714,7 +709,7 @@ SymbolicValue ConstExprEvaluator::getUnknown(SILNode *node,
 ///
 /// TODO: Return information about which callees were found to be
 /// constexprs, which would allow the caller to delete dead calls to them
-/// that occur after after folding them.
+/// that occur after folding them.
 void ConstExprEvaluator::computeConstantValues(
     ArrayRef<SILValue> values, SmallVectorImpl<SymbolicValue> &results) {
   unsigned numInstEvaluated = 0;
@@ -723,7 +718,7 @@ void ConstExprEvaluator::computeConstantValues(
     auto symVal = state.getConstantValue(v);
     results.push_back(symVal);
 
-    // Reset the execution limit back to zero for each subsexpression we look
+    // Reset the execution limit back to zero for each subexpression we look
     // at.  We don't want lots of constants folded to trigger a limit.
     numInstEvaluated = 0;
   }

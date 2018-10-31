@@ -148,8 +148,11 @@ static void diagnosePoundAssert(const SILInstruction *I,
          "sema prevents non-int1 #assert condition");
   if (intValue.isNullValue()) {
     auto *message = cast<StringLiteralInst>(builtinInst->getArguments()[1]);
+    StringRef messageValue = message->getValue();
+    if (messageValue.empty())
+      messageValue = "assertion failed";
     diagnose(M.getASTContext(), I->getLoc().getSourceLoc(),
-             diag::pound_assert_failure, message->getValue());
+             diag::pound_assert_failure, messageValue);
     return;
   }
 }
@@ -165,13 +168,18 @@ class EmitDFDiagnostics : public SILFunctionTransform {
       return;
 
     SILModule &M = getFunction()->getModule();
-    ConstExprEvaluator constantEvaluator(M);
     for (auto &BB : *getFunction())
       for (auto &I : BB) {
         diagnoseUnreachable(&I, M.getASTContext());
         diagnoseStaticReports(&I, M);
-        diagnosePoundAssert(&I, M, constantEvaluator);
       }
+
+    if (M.getASTContext().LangOpts.EnableExperimentalStaticAssert) {
+      ConstExprEvaluator constantEvaluator(M);
+      for (auto &BB : *getFunction())
+        for (auto &I : BB)
+          diagnosePoundAssert(&I, M, constantEvaluator);
+    }
   }
 };
 } // end anonymous namespace

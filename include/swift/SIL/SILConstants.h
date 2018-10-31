@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This defines an interface to represent SIL level structured constants in an
+// This defines an interface to represent SIL level structured constants in a
 // memory efficient way.
 //
 //===----------------------------------------------------------------------===//
@@ -19,6 +19,8 @@
 #define SWIFT_SIL_CONSTANTS_H
 
 #include "swift/SIL/SILValue.h"
+#include "llvm/Support/CommandLine.h"
+
 
 namespace swift {
 class SingleValueInstruction;
@@ -30,6 +32,8 @@ struct APIntSymbolicValue;
 struct ArraySymbolicValue;
 struct EnumWithPayloadSymbolicValue;
 struct UnknownSymbolicValue;
+
+extern llvm::cl::opt<unsigned> ConstExprLimit;
 
 /// When we fail to constant fold a value, this captures a reason why,
 /// allowing the caller to produce a specific diagnostic.  The "Unknown"
@@ -85,8 +89,8 @@ private:
     /// This value is represented with an inline integer representation.
     RK_IntegerInline,
 
-    /// This value is an array, struct, or tuple of constants.  This is
-    /// tracked by the "aggregate" member of the value union.
+    /// This value is a struct or tuple of constants.  This is tracked by the
+    /// "aggregate" member of the value union.
     RK_Aggregate,
   };
 
@@ -159,7 +163,7 @@ public:
 
   static SymbolicValue getUnknown(SILNode *node, UnknownReason reason,
                                   llvm::ArrayRef<SourceLoc> callStack,
-                                  llvm::BumpPtrAllocator &allocator);
+                                  ASTContext &astContext);
 
   /// Return true if this represents an unknown result.
   bool isUnknown() const { return getKind() == Unknown; }
@@ -200,15 +204,15 @@ public:
 
   static SymbolicValue getInteger(int64_t value, unsigned bitWidth);
   static SymbolicValue getInteger(const APInt &value,
-                                  llvm::BumpPtrAllocator &allocator);
+                                  ASTContext &astContext);
 
   APInt getIntegerValue() const;
   unsigned getIntegerValueBitWidth() const;
 
   /// This returns an aggregate value with the specified elements in it.  This
-  /// copies the elements into the specified allocator.
+  /// copies the elements into the specified ASTContext.
   static SymbolicValue getAggregate(ArrayRef<SymbolicValue> elements,
-                                    llvm::BumpPtrAllocator &allocator);
+                                    ASTContext &astContext);
 
   ArrayRef<SymbolicValue> getAggregateValue() const;
 
@@ -225,9 +229,9 @@ public:
   /// reason, we fall back to using the specified location.
   void emitUnknownDiagnosticNotes(SILLocation fallbackLoc);
 
-  /// Clone this SymbolicValue into the specified allocator and return the new
+  /// Clone this SymbolicValue into the specified ASTContext and return the new
   /// version.  This only works for valid constants.
-  SymbolicValue cloneInto(llvm::BumpPtrAllocator &allocator) const;
+  SymbolicValue cloneInto(ASTContext &astContext) const;
 
   void print(llvm::raw_ostream &os, unsigned indent = 0) const;
   void dump() const;
